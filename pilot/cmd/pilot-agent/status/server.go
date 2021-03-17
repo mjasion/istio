@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -509,6 +510,22 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 	}
 	// get the http client must exist because
 	httpClient := s.appProbeClient[path]
+	gotRedirectToHttps := false
+	httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		switch req.Response.StatusCode {
+		case 301, 302, 303, 307, 308:
+			location := req.Response.Header.Get("Location")
+			if strings.HasPrefix(location, "https") {
+				gotRedirectToHttps = true
+			}
+		}
+
+		// Don't change default behaviour on redirects.
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
 
 	proberPath := prober.HTTPGet.Path
 	if !strings.HasPrefix(proberPath, "/") {
@@ -542,7 +559,6 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 			appReq.Header.Set(h.Name, h.Value)
 		}
 	}
-
 	// Send the request.
 	response, err := httpClient.Do(appReq)
 	if err != nil {
@@ -550,6 +566,14 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+
+	if gotRedirectToHttps == true {
+		prober.HTTPGet.Scheme = apimirror.URISchemeHTTPS
+		if prober.HTTPGet.Port.IntVal == 80 {
+			prober.HTTPGet.Port = intstr.FromInt(443)
+		}
+	}
+
 	defer func() {
 		// Drain and close the body to let the Transport reuse the connection
 		_, _ = io.Copy(ioutil.Discard, response.Body)
